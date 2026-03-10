@@ -40,18 +40,16 @@ export function buildVideoPayload(
         },
     };
 
-    // Scene 2+: Image scenes (split remaining time across images)
+    // Scene 2+: Image scenes (avatar speaks nothing, images are the focus)
     const imageScenes = imageUrls.map((url) => ({
         character: {
             type: 'avatar',
             avatar_id: avatarId,
             avatar_style: 'normal',
-            scale: 0, // Hidden avatar — images are the focus
         },
         voice: {
-            type: 'text' as const,
-            voice_id: voiceId,
-            input_text: ' ', // Minimal silence placeholder
+            type: 'silence' as const,
+            duration: 5,
         },
         background: {
             type: 'image',

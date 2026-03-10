@@ -1,50 +1,47 @@
 'use client';
 
-import { useState, useRef, useCallback } from 'react';
+import { useState } from 'react';
 import { useRouter } from 'next/navigation';
 import Header from '@/components/Header';
 import { ContentType } from '@/lib/types';
 
 export default function CreateVideoPage() {
     const router = useRouter();
-    const fileInputRef = useRef<HTMLInputElement>(null);
 
     const [title, setTitle] = useState('');
     const [script, setScript] = useState('');
     const [contentType, setContentType] = useState<ContentType>('someday');
-    const [images, setImages] = useState<File[]>([]);
-    const [imagePreviews, setImagePreviews] = useState<string[]>([]);
     const [enableSchedule, setEnableSchedule] = useState(false);
     const [scheduledAt, setScheduledAt] = useState('');
+    const [topic, setTopic] = useState('');
     const [loading, setLoading] = useState(false);
+    const [generating, setGenerating] = useState(false);
     const [error, setError] = useState('');
-    const [dragging, setDragging] = useState(false);
 
-    const maxScript = 200;
+    const maxScript = 500;
 
-    const handleImageSelect = useCallback((files: FileList | null) => {
-        if (!files) return;
-        const newFiles = Array.from(files).filter((f) => f.type.startsWith('image/'));
-        const newPreviews = newFiles.map((f) => URL.createObjectURL(f));
-
-        setImages((prev) => [...prev, ...newFiles]);
-        setImagePreviews((prev) => [...prev, ...newPreviews]);
-    }, []);
-
-    const removeImage = (index: number) => {
-        URL.revokeObjectURL(imagePreviews[index]);
-        setImages((prev) => prev.filter((_, i) => i !== index));
-        setImagePreviews((prev) => prev.filter((_, i) => i !== index));
+    const handleGenerateScript = async () => {
+        setGenerating(true);
+        setError('');
+        try {
+            const res = await fetch('/api/generate-script', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ content_type: contentType, topic: topic.trim() }),
+            });
+            if (!res.ok) {
+                const data = await res.json();
+                throw new Error(data.error || 'Failed to generate script');
+            }
+            const data = await res.json();
+            setTitle(data.title);
+            setScript(data.script.slice(0, maxScript));
+        } catch (err) {
+            setError(err instanceof Error ? err.message : 'Script generation failed');
+        } finally {
+            setGenerating(false);
+        }
     };
-
-    const handleDrop = useCallback(
-        (e: React.DragEvent) => {
-            e.preventDefault();
-            setDragging(false);
-            handleImageSelect(e.dataTransfer.files);
-        },
-        [handleImageSelect]
-    );
 
     const handleSubmit = async (e: React.FormEvent) => {
         e.preventDefault();
@@ -58,30 +55,11 @@ export default function CreateVideoPage() {
             setError('Please enter a script');
             return;
         }
-        if (images.length === 0) {
-            setError('Please upload at least one image');
-            return;
-        }
 
         setLoading(true);
 
         try {
-            // Step 1: Upload images
-            const formData = new FormData();
-            images.forEach((img) => formData.append('files', img));
-
-            const uploadRes = await fetch('/api/upload', {
-                method: 'POST',
-                body: formData,
-            });
-
-            if (!uploadRes.ok) {
-                throw new Error('Image upload failed');
-            }
-
-            const { urls: imageUrls } = await uploadRes.json();
-
-            // Step 2: Create video record
+            // Step 1: Create video record
             const videoRes = await fetch('/api/videos', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
@@ -89,7 +67,7 @@ export default function CreateVideoPage() {
                     title: title.trim(),
                     script: script.trim(),
                     content_type: contentType,
-                    image_urls: imageUrls,
+                    image_urls: [],
                     ...(enableSchedule && scheduledAt ? { scheduled_at: scheduledAt } : {}),
                 }),
             });
@@ -100,7 +78,7 @@ export default function CreateVideoPage() {
 
             const { video } = await videoRes.json();
 
-            // Step 3: If not scheduled, trigger generation immediately
+            // Step 2: If not scheduled, trigger generation immediately
             if (!enableSchedule) {
                 await fetch(`/api/videos/${video.id}/generate`, {
                     method: 'POST',
@@ -136,33 +114,6 @@ export default function CreateVideoPage() {
                         </div>
                     )}
 
-                    {/* Title */}
-                    <div className="form-group">
-                        <label className="form-label">Video Title</label>
-                        <input
-                            type="text"
-                            className="form-input"
-                            placeholder="e.g. Monday Motivation Tip"
-                            value={title}
-                            onChange={(e) => setTitle(e.target.value)}
-                        />
-                    </div>
-
-                    {/* Script */}
-                    <div className="form-group">
-                        <label className="form-label">Script</label>
-                        <textarea
-                            className="form-textarea"
-                            placeholder="Write the script that the AI avatar will speak..."
-                            value={script}
-                            onChange={(e) => setScript(e.target.value.slice(0, maxScript))}
-                            rows={4}
-                        />
-                        <div className="form-hint">
-                            {script.length}/{maxScript} characters · The avatar will speak this in the first ~5 seconds
-                        </div>
-                    </div>
-
                     {/* Content Type */}
                     <div className="form-group">
                         <label className="form-label">Content Type</label>
@@ -186,57 +137,64 @@ export default function CreateVideoPage() {
                         </div>
                     </div>
 
-                    {/* Image Upload */}
+                    {/* AI Script Generator */}
                     <div className="form-group">
-                        <label className="form-label">
-                            Scene Images ({images.length} uploaded)
-                        </label>
-                        <div
-                            className={`upload-zone ${dragging ? 'dragging' : ''}`}
-                            onClick={() => fileInputRef.current?.click()}
-                            onDragOver={(e) => {
-                                e.preventDefault();
-                                setDragging(true);
-                            }}
-                            onDragLeave={() => setDragging(false)}
-                            onDrop={handleDrop}
-                        >
-                            <div className="upload-zone-icon">📁</div>
-                            <div className="upload-zone-text">
-                                Drop images here or click to browse
-                            </div>
-                            <div className="upload-zone-hint">
-                                PNG, JPG, WebP · These will appear as visual scenes after the avatar intro
-                            </div>
+                        <label className="form-label">Generate Script with AI</label>
+                        <div style={{ display: 'flex', gap: 8 }}>
+                            <input
+                                type="text"
+                                className="form-input"
+                                placeholder="Topic hint (optional) e.g. सफलता, पैसा, health tips..."
+                                value={topic}
+                                onChange={(e) => setTopic(e.target.value)}
+                                style={{ flex: 1 }}
+                            />
+                            <button
+                                type="button"
+                                className="btn btn-secondary"
+                                onClick={handleGenerateScript}
+                                disabled={generating}
+                                style={{ whiteSpace: 'nowrap' }}
+                            >
+                                {generating ? (
+                                    <>
+                                        <div className="spinner" /> Generating…
+                                    </>
+                                ) : (
+                                    '✨ Generate Hindi Script'
+                                )}
+                            </button>
                         </div>
-                        <input
-                            ref={fileInputRef}
-                            type="file"
-                            accept="image/*"
-                            multiple
-                            style={{ display: 'none' }}
-                            onChange={(e) => handleImageSelect(e.target.files)}
-                        />
+                        <div className="form-hint">
+                            AI will generate a Hindi title and script based on content type
+                        </div>
+                    </div>
 
-                        {imagePreviews.length > 0 && (
-                            <div className="upload-previews">
-                                {imagePreviews.map((src, i) => (
-                                    <div key={i} className="upload-preview">
-                                        <img src={src} alt={`Scene ${i + 1}`} />
-                                        <button
-                                            type="button"
-                                            className="upload-preview-remove"
-                                            onClick={(e) => {
-                                                e.stopPropagation();
-                                                removeImage(i);
-                                            }}
-                                        >
-                                            ×
-                                        </button>
-                                    </div>
-                                ))}
-                            </div>
-                        )}
+                    {/* Title */}
+                    <div className="form-group">
+                        <label className="form-label">Video Title</label>
+                        <input
+                            type="text"
+                            className="form-input"
+                            placeholder="AI-generated Hindi title will appear here..."
+                            value={title}
+                            onChange={(e) => setTitle(e.target.value)}
+                        />
+                    </div>
+
+                    {/* Script */}
+                    <div className="form-group">
+                        <label className="form-label">Script</label>
+                        <textarea
+                            className="form-textarea"
+                            placeholder="AI-generated Hindi script will appear here..."
+                            value={script}
+                            onChange={(e) => setScript(e.target.value.slice(0, maxScript))}
+                            rows={4}
+                        />
+                        <div className="form-hint">
+                            {script.length}/{maxScript} characters · The avatar will speak this
+                        </div>
                     </div>
 
                     {/* Scheduling */}

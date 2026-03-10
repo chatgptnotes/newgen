@@ -51,6 +51,7 @@ export interface HeyGenScene {
     type: string;
     voice_id?: string;
     input_text?: string;
+    duration?: number;
   };
   background?: {
     type: string;
