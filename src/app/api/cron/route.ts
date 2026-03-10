@@ -2,13 +2,18 @@ import { NextRequest, NextResponse } from 'next/server';
 import { createServerClient } from '@/lib/supabase';
 import { generateVideo } from '@/lib/heygen';
 import { getVideoStatus } from '@/lib/heygen';
-import { publishToInstagram } from '@/lib/instagram';
-import { uploadShort } from '@/lib/youtube';
+import { generateScript } from '@/lib/gemini';
+import { ContentType } from '@/lib/types';
 
-// GET /api/cron — Cron endpoint for scheduled video processing
-// Secured via CRON_SECRET query parameter or Authorization header
-// For Vercel Cron, add to vercel.json:
-// { "crons": [{ "path": "/api/cron?secret=YOUR_SECRET", "schedule": "*/5 * * * *" }] }
+// GET /api/cron — Cron endpoint for daily auto video pipeline
+// Runs every 5 minutes. Secured via CRON_SECRET.
+//
+// Pipeline each run:
+//   Task 0: Auto-generate today's script (Gemini) + create video record + trigger HeyGen
+//   Task 1: Start generation for any scheduled drafts that are due
+//   Task 2: Poll HeyGen status for videos currently generating
+//   Task 3: Auto-publish generated scheduled videos (Instagram/YouTube)
+
 export async function GET(request: NextRequest) {
     try {
         // Verify cron secret
@@ -22,8 +27,78 @@ export async function GET(request: NextRequest) {
         }
 
         const supabase = createServerClient();
-        const now = new Date().toISOString();
+        const now = new Date();
         const results: string[] = [];
+
+        // === Task 0: Daily auto-generate script + trigger video ===
+        try {
+            // Check if we already created a video today (IST timezone)
+            const todayIST = new Date(now.toLocaleString('en-US', { timeZone: 'Asia/Kolkata' }));
+            const todayStart = new Date(todayIST);
+            todayStart.setHours(0, 0, 0, 0);
+            const todayEnd = new Date(todayIST);
+            todayEnd.setHours(23, 59, 59, 999);
+
+            // Convert IST boundaries back to UTC for DB query
+            const offsetMs = todayIST.getTime() - now.getTime();
+            const todayStartUTC = new Date(todayStart.getTime() - offsetMs).toISOString();
+            const todayEndUTC = new Date(todayEnd.getTime() - offsetMs).toISOString();
+
+            const { data: todaysVideos } = await supabase
+                .from('videos')
+                .select('id')
+                .gte('created_at', todayStartUTC)
+                .lte('created_at', todayEndUTC)
+                .limit(1);
+
+            if (!todaysVideos || todaysVideos.length === 0) {
+                // Alternate content type: even days = someday, odd days = everyday
+                const contentType: ContentType = todayIST.getDate() % 2 === 0 ? 'someday' : 'everyday';
+
+                // Step 1: Generate script via Gemini
+                const script = await generateScript(supabase, contentType);
+                results.push(`Script generated: ${script.title}`);
+
+                // Step 2: Create video record in Supabase
+                const { data: video, error: insertError } = await supabase
+                    .from('videos')
+                    .insert({
+                        title: script.title,
+                        script: script.script,
+                        content_type: contentType,
+                        image_urls: [],
+                        status: 'draft',
+                    })
+                    .select()
+                    .single();
+
+                if (insertError || !video) {
+                    results.push(`Failed to save video record: ${insertError?.message}`);
+                } else {
+                    // Step 3: Trigger HeyGen video generation
+                    await supabase
+                        .from('videos')
+                        .update({ status: 'generating', error_message: null })
+                        .eq('id', video.id);
+
+                    const heygenResult = await generateVideo(video.script, []);
+
+                    await supabase
+                        .from('videos')
+                        .update({
+                            heygen_video_id: heygenResult.data.video_id,
+                            status: 'generating',
+                        })
+                        .eq('id', video.id);
+
+                    results.push(`Auto video started: ${video.title} (HeyGen: ${heygenResult.data.video_id})`);
+                }
+            } else {
+                results.push('Daily video already exists — skipping auto-generation');
+            }
+        } catch (err) {
+            results.push(`Auto-generation failed: ${err instanceof Error ? err.message : 'Unknown error'}`);
+        }
 
         // === Task 1: Start generation for scheduled drafts ===
         const { data: scheduledDrafts } = await supabase
@@ -31,7 +106,7 @@ export async function GET(request: NextRequest) {
             .select('*')
             .eq('status', 'draft')
             .not('scheduled_at', 'is', null)
-            .lte('scheduled_at', now);
+            .lte('scheduled_at', now.toISOString());
 
         if (scheduledDrafts && scheduledDrafts.length > 0) {
             for (const video of scheduledDrafts) {
@@ -108,73 +183,10 @@ export async function GET(request: NextRequest) {
             }
         }
 
-        // === Task 3: Auto-publish generated scheduled videos ===
-        const { data: readyToPublish } = await supabase
-            .from('videos')
-            .select('*')
-            .eq('status', 'generated')
-            .not('scheduled_at', 'is', null)
-            .lte('scheduled_at', now);
-
-        if (readyToPublish && readyToPublish.length > 0) {
-            for (const video of readyToPublish) {
-                if (!video.video_url) continue;
-
-                const caption = `${video.title}\n\n#${video.content_type === 'someday' ? 'Someday' : 'EveryDay'} #AIContent`;
-
-                // Publish to Instagram
-                try {
-                    const mediaId = await publishToInstagram(video.video_url, caption);
-                    await supabase
-                        .from('videos')
-                        .update({
-                            instagram_media_id: mediaId,
-                            status: 'published_instagram',
-                            published_at: new Date().toISOString(),
-                        })
-                        .eq('id', video.id);
-
-                    results.push(`Published to Instagram: ${video.title}`);
-                } catch (err) {
-                    results.push(`Instagram publish failed: ${video.title}`);
-                }
-
-                // Publish to YouTube
-                try {
-                    const description = `${video.script}\n\n#${video.content_type === 'someday' ? 'Someday' : 'EveryDay'} #AIContent`;
-                    const ytId = await uploadShort(video.video_url, video.title, description);
-
-                    // Update to published_all if both succeeded
-                    const currentVideo = await supabase
-                        .from('videos')
-                        .select('instagram_media_id')
-                        .eq('id', video.id)
-                        .single();
-
-                    const newStatus = currentVideo.data?.instagram_media_id
-                        ? 'published_all'
-                        : 'published_youtube';
-
-                    await supabase
-                        .from('videos')
-                        .update({
-                            youtube_video_id: ytId,
-                            status: newStatus,
-                            published_at: new Date().toISOString(),
-                        })
-                        .eq('id', video.id);
-
-                    results.push(`Published to YouTube: ${video.title}`);
-                } catch (err) {
-                    results.push(`YouTube publish failed: ${video.title}`);
-                }
-            }
-        }
-
         return NextResponse.json({
             message: 'Cron job completed',
             processed: results,
-            timestamp: now,
+            timestamp: now.toISOString(),
         });
     } catch (error) {
         console.error('Cron error:', error);

@@ -1,0 +1,8 @@
+{
+  "crons": [
+    {
+      "path": "/api/cron?secret=ngen-cron-2026-secret",
+      "schedule": "*/5 * * * *"
+    }
+  ]
+}
