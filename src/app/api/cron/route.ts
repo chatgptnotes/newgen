@@ -3,6 +3,7 @@ import { createServerClient } from '@/lib/supabase';
 import { generateVideo } from '@/lib/heygen';
 import { getVideoStatus } from '@/lib/heygen';
 import { generateScript } from '@/lib/gemini';
+import { publishToInstagram } from '@/lib/instagram';
 import { ContentType } from '@/lib/types';
 
 // GET /api/cron — Cron endpoint for daily auto video pipeline
@@ -179,6 +180,50 @@ export async function GET(request: NextRequest) {
                     }
                 } catch (err) {
                     results.push(`Status check error for: ${video.title}`);
+                }
+            }
+        }
+
+        // === Task 3: Auto-publish generated videos to Instagram ===
+        const { data: readyVideos } = await supabase
+            .from('videos')
+            .select('*')
+            .eq('status', 'generated')
+            .not('video_url', 'is', null);
+
+        if (readyVideos && readyVideos.length > 0) {
+            for (const video of readyVideos) {
+                try {
+                    // Mark as publishing
+                    await supabase
+                        .from('videos')
+                        .update({ status: 'publishing_instagram' })
+                        .eq('id', video.id);
+
+                    const caption = `${video.title}\n\n#motivation #success #drmuralibk #hope #hospital #nagpur`;
+                    const mediaId = await publishToInstagram(video.video_url!, caption);
+
+                    await supabase
+                        .from('videos')
+                        .update({
+                            status: 'published_instagram',
+                            instagram_media_id: mediaId,
+                            published_at: new Date().toISOString(),
+                        })
+                        .eq('id', video.id);
+
+                    results.push(`Published to Instagram: ${video.title} (media: ${mediaId})`);
+                } catch (err) {
+                    // Revert status back to generated so it retries next cron run
+                    await supabase
+                        .from('videos')
+                        .update({
+                            status: 'generated',
+                            error_message: err instanceof Error ? err.message : 'Instagram publish failed',
+                        })
+                        .eq('id', video.id);
+
+                    results.push(`Instagram publish failed for: ${video.title} — ${err instanceof Error ? err.message : 'Unknown error'}`);
                 }
             }
         }
